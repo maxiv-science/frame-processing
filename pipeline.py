@@ -12,44 +12,73 @@ import fabio
 
 INTERNAL_PORT = 5550
 
-class Downsampler(object):
+class Task(object):
+    """
+    Class representing a type of work on a frame, like integration or
+    downsampling.
+    """
+    def __init__(self, name):
+        self.name = name
+
+    def make_extras(self):
+        """
+        Generate extra data, for example the angular axes for
+        integrated data. Called once at the beginning.
+        """
+        return {}
+
+    def perform(self, frame):
+        raise NotImplementedError
+
+class Downsampling(Task):
     """
     Uses stride_tricks to quickly bin pixels in n-by-n groups. Faster
     than a plain c-loop for n>8 or so, only a little slower for n<8.
     """
-    def __init__(self, n):
+    def __init__(self, name, n):
+        super().__init__(name)
         self.n = n
-    def downsample(self, img):
+
+    def perform(self, frame):
         n = self.n
-        strided = as_strided(img,
-            shape=(img.shape[0]//n, img.shape[1]//n, n, n),
-            strides=((img.strides[0]*n, img.strides[1]*n)+img.strides))
+        strided = as_strided(frame,
+            shape=(frame.shape[0]//n, frame.shape[1]//n, n, n),
+            strides=((frame.strides[0]*n, frame.strides[1]*n)+frame.strides))
         return strided.sum(axis=-1).sum(axis=-1)
+
+class Integration(Task):
+    """
+    Uses the fast azint module for cake integration. The parameters
+    are just a list of *args that is passed to azint.AzimuthalIntegrator.
+    """
+    def __init__(self, name, pars):
+        super().__init__(name)
+        self.pars = pars
+        self.ai = AzimuthalIntegrator(*pars, create=False)
+
+    def perform(self, frame):
+        return self.ai.integrate(frame)
+
+    def make_extras(self):
+        radial_bins = self.pars[-1][0]
+        phi_bins = self.pars[-1][1]
+        return {'q': 0.5*(radial_bins[:-1] + radial_bins[1:]),
+                'phi': 0.5*(phi_bins[:-1] + phi_bins[1:])}
 
 class Worker(Process):
     """
     General worker which can set up for various sorts of work.
     """
-    def __init__(self, worker_id, nworkers,
-                       do_integration=False, integration_params=None,
-                       do_downsampling=False, downsampling_params=None):
+    def __init__(self, worker_id, nworkers, tasks):
         super().__init__()
         self.worker_id = worker_id
         self.nworkers = nworkers
-
-        # choose what work to do - this is a bit stupid because making the ai
-        # object takes time, and in the constructor it gets done sequentially.
-        if do_integration:
-            ai = AzimuthalIntegrator(*integration_params, create=False)
-            self.process = lambda img: ai.integrate(img)
-        elif do_downsampling:
-            ds = Downsampler(*downsampling_params)
-            self.process = lambda img: ds.downsample(img)
+        self.tasks = tasks
         print('Constucting worker %u out of %u'%(worker_id, nworkers))
 
 class ZmqWorker(Worker):
-    def __init__(self, *args, pullhost='tcp://p-daq-cn-2', pullport=20001, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, pullhost='tcp://p-daq-cn-2', pullport=20001):
+        super().__init__(*args)
         self.pullhost = pullhost
         self.pullport = pullport
 
@@ -64,18 +93,21 @@ class ZmqWorker(Worker):
             header = json.loads(parts[0].bytes)
             if header['htype'] == 'image':
                 img = decompress_lz4(parts[1].buffer, header['shape'], np.dtype(header['type']))
-                res = self.process(img)
-                header['type'] = str(res.dtype)
-                header['shape'] = res.shape
-                header['compression'] = 'none'
-                push_sock.send_json(header, flags=zmq.SNDMORE)
-                push_sock.send(res)
+                for itask, task in enumerate(self.tasks):
+                    res = task.perform(img)
+                    header['type'] = str(res.dtype)
+                    header['shape'] = res.shape
+                    header['compression'] = 'none'
+                    header['name'] = task.name
+                    push_sock.send_json(header, flags=zmq.SNDMORE)
+                    flag = 0 if itask == len(tasks) else zmq.SNDMORE
+                    push_sock.send(res, flag)
             else:
                 push_sock.send_json(header)
 
 class Hdf5Worker(Worker):
-    def __init__(self, *args, filename=None, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, filename=''):
+        super().__init__(*args)
         self.filename = filename
 
     def run(self):
@@ -89,17 +121,24 @@ class Hdf5Worker(Worker):
             hdr = {'filename': self.filename,
                    'htype': 'header',
                    'msg_number': -1}
+            # possibly a race condition if this process becomes delayed, would
+            # have wanted a barrier here to make sure the header comes first.
+            # not likely though.
             push_sock.send_json(hdr)
         for i in range(self.worker_id, nimages, self.nworkers):
             img = dset[i]
-            res = self.process(img)
             header = {'msg_number': i,
-                      'type': str(img.dtype),
-                      'shape': res.shape,
                       'compression': 'none',
-                      'htype': 'image',}
-            push_sock.send_json(header, flags=zmq.SNDMORE)
-            push_sock.send(res)
+                      'htype': 'image'}
+            for itask, task in enumerate(self.tasks):
+                res = task.perform(img)
+                header['type'] = str(res.dtype)
+                header['shape'] = res.shape
+                header['name'] = task.name
+                push_sock.send_json(header, flags=zmq.SNDMORE)
+                flag = 0 if (itask == len(tasks) - 1) else zmq.SNDMORE
+                push_sock.send(res, flag)
+
             if i == nimages - 1:
                 closing = {'htype': 'series_end',
                            'msg_number': nimages,}
@@ -125,8 +164,7 @@ def ordered_recv(sock):
             cache[msg_number] = parts
     
 
-def collector(radial_bins, phi_bins, disposable=False):
-    base_folder = '/data/staff/nanomax/commissioning_2020-2/20201214_integ/process/radial_integration/'
+def collector(tasks, base_folder, disposable=False):
     context = zmq.Context()
     pull_sock = context.socket(zmq.PULL)
     pull_sock.bind('tcp://*:%u'%INTERNAL_PORT)
@@ -136,22 +174,23 @@ def collector(radial_bins, phi_bins, disposable=False):
         print(index, header)
         htype = header['htype']
         if htype == 'image':
-            print('******', header['type'])
-            res = np.frombuffer(parts[1], header['type']).reshape(header['shape'])
-            #dsetname = header['dsetname']
-            dsetname = 'reduced'
-            if fh:
-                dset = fh.get(dsetname)
-                if not dset:
-#                    fh.create_dataset('q', data=0.5*(radial_bins[:-1] + radial_bins[1:]))
-#                    fh.create_dataset('phi', data=0.5*(phi_bins[:-1] + phi_bins[1:]))
-                    dset = fh.create_dataset(dsetname, dtype=header['type'],
-                                               shape=(0, *res.shape), 
-                                               maxshape=(None, *res.shape),
-                                               chunks=(1, *res.shape))
-                n = dset.shape[0]
-                dset.resize(n+1, axis=0)
-                dset[n] = res
+            for task in tasks:
+                header = json.loads(parts.pop(0))
+                payload = parts.pop(0)
+                res = np.frombuffer(payload, header['type']).reshape(header['shape'])
+                dsetname = header['name']
+                if fh:
+                    dset = fh.get(dsetname)
+                    if not dset:
+                        for k, v in task.make_extras().items():
+                            fh.create_dataset(k, data=v)
+                        dset = fh.create_dataset(dsetname, dtype=header['type'],
+                                                   shape=(0, *res.shape), 
+                                                   maxshape=(None, *res.shape),
+                                                   chunks=(1, *res.shape))
+                    n = dset.shape[0]
+                    dset.resize(n+1, axis=0)
+                    dset[n] = res
 
         elif htype == 'header':
             filename = header['filename']
@@ -161,7 +200,7 @@ def collector(radial_bins, phi_bins, disposable=False):
                 output_file = os.path.join(output_folder, fname)
                 if not os.path.exists(output_folder):
                     os.mkdir(output_folder)
-                fh = h5py.File(output_file, 'w-')
+                fh = h5py.File(output_file, 'w')
             else:
                 fh = None
                 
@@ -173,26 +212,33 @@ def collector(radial_bins, phi_bins, disposable=False):
                 return
 
 if __name__ == '__main__':
+
+    # parameters and shared memory for radial integration
+    base_folder = '/data/staff/nanomax/commissioning_2020-2/20201214_integ/process/radial_integration/'
     poni_file = '/data/visitors/nanomax/20200364/2020120208/process/Detector_calibration/Si_scan2.poni'
     pixel_size = 75.0e-6
     n_splitting = 4
-    nworkers = 8
     mask = fabio.open('/data/visitors/nanomax/20200364/2020120208/process/Detector_calibration/mask_scan2.edf').data
     radial_bins = np.linspace(0.0, 38.44, 301)
     phi_bins = np.linspace(-np.pi, np.pi, 701)
     integ_pars = [poni_file, mask.shape, pixel_size, n_splitting, mask, [radial_bins, phi_bins]]
     ai = AzimuthalIntegrator(*integ_pars)
 
+    # set up a list of tasks for each process to do
+    tasks = []
+    tasks.append(Integration(name='cake', pars=integ_pars))
+    tasks.append(Downsampling(name='binned', n=5))
+    tasks.append(Downsampling(name='binned_a_lot', n=100))
+
+    nworkers = 12
     procs = []
     for i in range(nworkers):
-        p = ZmqWorker(i, nworkers, do_integration=True, integration_params=integ_pars)
-#        p = ZmqWorker(i, nworkers, do_downsampling=True, downsampling_params=[10,])
-#        p = Hdf5Worker(i, nworkers, do_integration=True, integration_params=integ_pars,
-#            filename='/data/staff/nanomax/commissioning_2020-2/20201214_integ/raw/sample/scan_000022_eiger.hdf5')
+#        p = ZmqWorker(i, nworkers, tasks)
+        p = Hdf5Worker(i, nworkers, tasks, filename='/data/staff/nanomax/commissioning_2020-2/20201214_integ/raw/sample/scan_000020_eiger.hdf5')
         p.start()
         procs.append(p)
 
-    collector(radial_bins, phi_bins)#, disposable=True) # set this for offline hdf5 processing
+    collector(tasks, base_folder, disposable=True) # set this True for offline hdf5 processing
         
     for i in range(nworkers):
         procs[i].join()
