@@ -7,50 +7,85 @@ import numpy as np
 from multiprocessing import Process
 from azint import AzimuthalIntegrator
 from bitshuffle import decompress_lz4
-import fabio 
+import fabio
 
-def zmq_worker(poni_file, pixel_size, n_splitting, mask, bins):
-    context = zmq.Context()
-    pull_sock = context.socket(zmq.PULL)
-    pull_sock.connect('tcp://p-daq-cn-2:20001')
-    push_sock = context.socket(zmq.PUSH)
-    push_sock.connect('tcp://localhost:5550')
-    
-    ai = AzimuthalIntegrator(poni_file, mask.shape, pixel_size, n_splitting, mask, bins, create=False)
-    while True:
-        parts = pull_sock.recv_multipart(copy=False)
-        header = json.loads(parts[0].bytes)
-        #print(header)
-        if header['htype'] == 'image':
-            img = decompress_lz4(parts[1].buffer, header['shape'], np.dtype(header['type']))
-            res = ai.integrate(img)
-            header['type'] = 'float32'
-            header['shape'] = res.shape
-            header['compression'] = 'none'
+class Worker(Process):
+    """
+    General worker which can set up for various sorts of work.
+    """
+    def __init__(self, worker_id, nworkers,
+                       do_integration=False, integration_params=None,
+                       do_downsampling=False, downsampling_params=None):
+        super().__init__()
+        self.worker_id = worker_id
+        self.nworkers = nworkers
+
+        # choose what work to do - this is a bit stupid because making the ai
+        # object takes time, and in the constructor it gets done sequentially.
+        if do_integration:
+            ai = AzimuthalIntegrator(*integration_params, create=False)
+            self.process = lambda img: ai.integrate(img)
+        print('Constucting worker %u out of %u'%(worker_id, nworkers))
+
+class ZmqWorker(Worker):
+    def __init__(self, *args, pullhost='tcp://p-daq-cn-2', pullport=20001, pushport=5550, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pullhost = pullhost
+        self.pullport = pullport
+        self.pushport = pushport
+
+    def run(self):
+        context = zmq.Context()
+        pull_sock = context.socket(zmq.PULL)
+        pull_sock.connect('%s:%u'%(self.pullhost, self.pullport))
+        push_sock = context.socket(zmq.PUSH)
+        push_sock.connect('tcp://localhost:%u'%self.pushport)
+        while True:
+            parts = pull_sock.recv_multipart(copy=False)
+            header = json.loads(parts[0].bytes)
+            if header['htype'] == 'image':
+                img = decompress_lz4(parts[1].buffer, header['shape'], np.dtype(header['type']))
+                res = self.process(img)
+                header['type'] = 'float32'
+                header['shape'] = res.shape
+                header['compression'] = 'none'
+                push_sock.send_json(header, flags=zmq.SNDMORE)
+                push_sock.send(res)
+            else:
+                push_sock.send_json(header)
+
+class Hdf5Worker(Worker):
+    def __init__(self, *args, filename=None, pushport=5550, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pushport = pushport
+        self.filename = filename
+
+    def run(self):
+        context = zmq.Context()
+        push_sock = context.socket(zmq.PUSH)
+        push_sock.connect('tcp://localhost:%u'%self.pushport)
+        fh = h5py.File(self.filename, 'r')
+        dset = fh['/entry/measurement/Eiger/data']
+        nimages = len(dset)
+        if self.worker_id == 0:
+            hdr = {'filename': self.filename,
+                   'htype': 'header',
+                   'msg_number': -1}
+            push_sock.send_json(hdr)
+        for i in range(self.worker_id, nimages, self.nworkers):
+            img = dset[i]
+            res = self.process(img)
+            header = {'msg_number': i,
+                      'type': 'float32',
+                      'shape': res.shape,
+                      'compression': 'none',
+                      'htype': 'image',}
             push_sock.send_json(header, flags=zmq.SNDMORE)
             push_sock.send(res)
-        else:
-            push_sock.send_json(header)
-            
-            
-def hdf5_worker(filename, worker_id, nworkers, poni_file, pixel_size, n_splitting, mask, bins):
-    context = zmq.Context()
-    push_sock = context.socket(zmq.PUSH)
-    push_sock.connect('tcp://localhost:5550')
-    fh = h5py.File(filename, 'r')
-    dset = fh['/entry/measurement/Eiger/data']
-    nimages = len(dset)
-    
-    ai = AzimuthalIntegrator(poni_file, mask.shape, pixel_size, n_splitting, mask, bins, create=False)
-    for i in range(worker_id, nimages, nworkers):
-        img = dset[i]
-        res = ai.integrate(img)
-        header = {'msg_number': i,
-                  'type': 'float32',
-                  'shape': res.shape,
-                  'compression': 'none'}
-        push_sock.send_json(header, flags=zmq.SNDMORE)
-        push_sock.send(res)
+            if i == nimages - 1:
+                closing = {'htype': 'series_end',
+                           'msg_number': nimages,}
+                push_sock.send_json(closing)
             
 def ordered_recv(sock):
     cache = {}
@@ -58,7 +93,6 @@ def ordered_recv(sock):
     while True:
         parts = sock.recv_multipart()
         header = json.loads(parts[0])
-        #print('ordered_recv', header)
         msg_number = header['msg_number']
         if header['htype'] == 'header':
             next_msg_number = msg_number
@@ -73,7 +107,7 @@ def ordered_recv(sock):
             cache[msg_number] = parts
     
 
-def collector(radial_bins, phi_bins):
+def collector(radial_bins, phi_bins, disposable=False):
     base_folder = '/data/staff/nanomax/commissioning_2020-2/20201214_integ/process/radial_integration/'
     context = zmq.Context()
     pull_sock = context.socket(zmq.PULL)
@@ -106,7 +140,6 @@ def collector(radial_bins, phi_bins):
                 output_file = os.path.join(output_folder, fname)
                 if not os.path.exists(output_folder):
                     os.mkdir(output_folder)
-                print(output_file)
                 fh = h5py.File(output_file, 'w-')
             else:
                 fh = None
@@ -116,25 +149,29 @@ def collector(radial_bins, phi_bins):
             print('end')
             if fh:
                 fh.close()
+            if disposable:
+                return
 
 if __name__ == '__main__':
     poni_file = '/data/visitors/nanomax/20200364/2020120208/process/Detector_calibration/Si_scan2.poni'
     pixel_size = 75.0e-6
     n_splitting = 4
-    nworkers = 12
+    nworkers = 8
     mask = fabio.open('/data/visitors/nanomax/20200364/2020120208/process/Detector_calibration/mask_scan2.edf').data
     radial_bins = np.linspace(0.0, 38.44, 301)
-    phi_bins = np.linspace(-np.pi, np.pi, 2)
-    ai = AzimuthalIntegrator(poni_file, mask.shape, pixel_size, n_splitting, mask, [radial_bins, phi_bins])
+    phi_bins = np.linspace(-np.pi, np.pi, 701)
+    integ_pars = [poni_file, mask.shape, pixel_size, n_splitting, mask, [radial_bins, phi_bins]]
+    ai = AzimuthalIntegrator(*integ_pars)
 
     procs = []
     for i in range(nworkers):
-        p = Process(target=zmq_worker, args=(poni_file, pixel_size, n_splitting, mask, [radial_bins, phi_bins]))
+        p = ZmqWorker(i, nworkers, do_integration=True, integration_params=integ_pars)
+#        p = Hdf5Worker(i, nworkers, do_integration=True, integration_params=integ_pars,
+#            filename='/data/staff/nanomax/commissioning_2020-2/20201214_integ/raw/sample/scan_000022_eiger.hdf5')
         p.start()
         procs.append(p)
-        
-        
-    collector(radial_bins, phi_bins)
+
+    collector(radial_bins, phi_bins)#, disposable=True)
         
     for i in range(nworkers):
         procs[i].join()
