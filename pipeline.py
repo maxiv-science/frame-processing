@@ -100,7 +100,7 @@ class ZmqWorker(Worker):
                     header['compression'] = 'none'
                     header['name'] = task.name
                     push_sock.send_json(header, flags=zmq.SNDMORE)
-                    flag = 0 if itask == len(tasks) else zmq.SNDMORE
+                    flag = 0 if (itask == len(tasks) - 1) else zmq.SNDMORE
                     push_sock.send(res, flag)
             else:
                 push_sock.send_json(header)
@@ -169,9 +169,17 @@ def collector(tasks, base_folder, disposable=False):
     pull_sock = context.socket(zmq.PULL)
     pull_sock.bind('tcp://*:%u'%INTERNAL_PORT)
     fh = None
+    frames_total = 0
+    frames_since_print = 0
+    next_print = int(time.time() // 1)
     for index, parts in ordered_recv(pull_sock):
+        frames_total += 1
+        frames_since_print += 1
+        if int(time.time() // 1) >= next_print:
+            print('%u new, %u total'%(frames_since_print, frames_total))
+            frames_since_print = 0
+            next_print = int(time.time() // 1) + 1
         header = json.loads(parts[0])
-        print(index, header)
         htype = header['htype']
         if htype == 'image':
             for task in tasks:
