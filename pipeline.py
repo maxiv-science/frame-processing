@@ -8,7 +8,6 @@ from numpy.lib.stride_tricks import as_strided
 from multiprocessing import Process
 from azint import AzimuthalIntegrator
 from bitshuffle import decompress_lz4
-import fabio
 
 INTERNAL_PORT = 5550
 
@@ -51,19 +50,15 @@ class Integration(Task):
     Uses the fast azint module for cake integration. The parameters
     are just a list of *args that is passed to azint.AzimuthalIntegrator.
     """
-    def __init__(self, name, pars):
+    def __init__(self, name, ai):
         super().__init__(name)
-        self.pars = pars
-        self.ai = AzimuthalIntegrator(*pars, create=False)
+        self.ai = ai
 
     def perform(self, frame):
         return self.ai.integrate(frame)
 
     def make_extras(self):
-        radial_bins = self.pars[-1][0]
-        phi_bins = self.pars[-1][1]
-        return {'q': 0.5*(radial_bins[:-1] + radial_bins[1:]),
-                'phi': 0.5*(phi_bins[:-1] + phi_bins[1:])}
+        return {'q': self.ai.q, 'phi': self.ai.phi}
 
 class Worker(Process):
     """
@@ -100,7 +95,7 @@ class ZmqWorker(Worker):
                     header['compression'] = 'none'
                     header['name'] = task.name
                     push_sock.send_json(header, flags=zmq.SNDMORE)
-                    flag = 0 if (itask == len(tasks) - 1) else zmq.SNDMORE
+                    flag = 0 if (itask == len(self.tasks) - 1) else zmq.SNDMORE
                     push_sock.send(res, flag)
             else:
                 push_sock.send_json(header)
@@ -136,7 +131,7 @@ class Hdf5Worker(Worker):
                 header['shape'] = res.shape
                 header['name'] = task.name
                 push_sock.send_json(header, flags=zmq.SNDMORE)
-                flag = 0 if (itask == len(tasks) - 1) else zmq.SNDMORE
+                flag = 0 if (itask == len(self.tasks) - 1) else zmq.SNDMORE
                 push_sock.send(res, flag)
 
             if i == nimages - 1:
@@ -164,7 +159,7 @@ def ordered_recv(sock):
             cache[msg_number] = parts
     
 
-def collector(tasks, base_folder, disposable=False):
+def collector(tasks, disposable=False):
     context = zmq.Context()
     pull_sock = context.socket(zmq.PULL)
     pull_sock.bind('tcp://*:%u'%INTERNAL_PORT)
@@ -191,7 +186,8 @@ def collector(tasks, base_folder, disposable=False):
                     dset = fh.get(dsetname)
                     if not dset:
                         for k, v in task.make_extras().items():
-                            fh.create_dataset(k, data=v)
+                            if v is not None:
+                                fh.create_dataset(k, data=v)
                         dset = fh.create_dataset(dsetname, dtype=header['type'],
                                                    shape=(0, *res.shape), 
                                                    maxshape=(None, *res.shape),
@@ -204,10 +200,10 @@ def collector(tasks, base_folder, disposable=False):
             filename = header['filename']
             if filename:
                 path, fname = os.path.split(filename)
-                output_folder = os.path.join(base_folder, path.split(os.sep)[-1])
+                output_folder = path.replace('raw', 'process/frameprocessing')
                 output_file = os.path.join(output_folder, fname)
                 if not os.path.exists(output_folder):
-                    os.mkdir(output_folder)
+                    os.makedirs(output_folder)
                 fh = h5py.File(output_file, 'w')
             else:
                 fh = None
@@ -222,33 +218,32 @@ def collector(tasks, base_folder, disposable=False):
 if __name__ == '__main__':
 
     # parameters and shared memory for radial integration
-    base_folder = '/data/staff/nanomax/commissioning_2020-2/20201214_integ/process/radial_integration/'
-    poni_file = '/data/visitors/nanomax/20200364/2020120208/process/Detector_calibration/Si_scan2.poni'
+    poni_file = '/data/staff/nanomax/commissioning_2021-1/20210427/process/temp.poni'
     pixel_size = 75.0e-6
     n_splitting = 4
-    mask = fabio.open('/data/visitors/nanomax/20200364/2020120208/process/Detector_calibration/mask_scan2.edf').data
-    radial_bins = np.linspace(0.0, 38.44, 301)
+    mask = np.load('/data/visitors/nanomax/common/masks/eiger/20210427.npy')
     phi_bins = np.linspace(-np.pi, np.pi, 701)
-    integ_pars = [poni_file, mask.shape, pixel_size, n_splitting, mask, [radial_bins, phi_bins]]
-    ai = AzimuthalIntegrator(*integ_pars)
+    bins = [2000, phi_bins] # if you want cake integration
+    bins = [2000,]
+    ai = AzimuthalIntegrator(poni_file, mask.shape, pixel_size, n_splitting, bins, mask=mask, solid_angle=True)
 
     # set up a list of tasks for each process to do
     tasks = []
-    tasks.append(Integration(name='cake', pars=integ_pars))
-    tasks.append(Downsampling(name='binned', n=5))
-    tasks.append(Downsampling(name='binned_a_lot', n=100))
+    tasks.append(Integration(name='I', ai=ai))
+    #tasks.append(Downsampling(name='binned', n=5))
+    #tasks.append(Downsampling(name='binned_a_lot', n=100))
 
     nworkers = 12
     procs = []
     for i in range(nworkers):
-#        p = ZmqWorker(i, nworkers, tasks)
-        p = Hdf5Worker(i, nworkers, tasks, filename='/data/staff/nanomax/commissioning_2020-2/20201214_integ/raw/sample/scan_000020_eiger.hdf5')
+        #p = ZmqWorker(i, nworkers, tasks, pullhost='tcp://p-daq-cn-1', pullport=20001)
+        p = Hdf5Worker(i, nworkers, tasks, filename='/data/staff/nanomax/commissioning_2021-1/20210427/raw/sample/scan_000037_eiger.hdf5')
         p.start()
         procs.append(p)
 
-    collector(tasks, base_folder, disposable=True) # set this True for offline hdf5 processing
+    collector(tasks, disposable=True) # set this True for offline hdf5 processing
         
     for i in range(nworkers):
         procs[i].join()
 
-    ai.close()
+#    ai.close()
