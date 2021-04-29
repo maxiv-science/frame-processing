@@ -9,7 +9,7 @@ import sys
 
 if len(sys.argv) < 6:
     print('Usage:')
-    print('online_integration.py <poni> <psize> <mask> <q_bins> <phi_bins>')
+    print('online_integration.py <datafile> <poni> <psize> <mask> <q_bins> <phi_bins>')
     print('\n Cake integration and more settings are avilable but hard coded for now.')
     exit(0)
 
@@ -27,7 +27,7 @@ mask = np.load(maskfile)
 if phi_bins == 1:
     bins = [q_bins,]
 else:
-    phi_bins = np.linspace(-np.pi, np.pi, phi_bins)
+    phi_bins = np.linspace(-np.pi, np.pi, phi_bins+1)
     bins = [q_bins, phi_bins] # if you want cake integration
 ai = AzimuthalIntegrator(poni_file, mask.shape, pixel_size, n_splitting, bins, mask=mask, solid_angle=True)
 

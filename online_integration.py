@@ -26,7 +26,7 @@ mask = np.load(maskfile)
 if phi_bins == 1:
     bins = [q_bins,]
 else:
-    phi_bins = np.linspace(-np.pi, np.pi, phi_bins)
+    phi_bins = np.linspace(-np.pi, np.pi, phi_bins+1)
     bins = [q_bins, phi_bins] # if you want cake integration
 ai = AzimuthalIntegrator(poni_file, mask.shape, pixel_size, n_splitting, bins, mask=mask, solid_angle=True)
 
@@ -37,7 +37,6 @@ nworkers = 12
 procs = []
 for i in range(nworkers):
     p = ZmqWorker(i, nworkers, tasks, pullhost='tcp://p-daq-cn-1', pullport=20001)
-#        p = Hdf5Worker(i, nworkers, tasks, filename='/data/staff/nanomax/commissioning_2020-2/20201214_integ/raw/sample/scan_000020_eiger.hdf5')
     p.start()
     procs.append(p)
 
