@@ -36,7 +36,7 @@ tasks = [Integration(name='I', ai=ai),]
 nworkers = 12
 procs = []
 for i in range(nworkers):
-    p = ZmqWorker(i, nworkers, tasks, pullhost='tcp://p-daq-cn-1', pullport=20001)
+    p = ZmqWorker(i, nworkers, tasks, pullhost='tcp://p-daq-cn-2', pullport=20005)
     p.start()
     procs.append(p)
 

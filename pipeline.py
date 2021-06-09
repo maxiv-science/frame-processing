@@ -86,8 +86,10 @@ class ZmqWorker(Worker):
         while True:
             parts = pull_sock.recv_multipart(copy=False)
             header = json.loads(parts[0].bytes)
+            print("header: ", header)
             if header['htype'] == 'image':
                 img = decompress_lz4(parts[1].buffer, header['shape'], np.dtype(header['type']))
+                print("after decomp.")
                 for itask, task in enumerate(self.tasks):
                     res = task.perform(img)
                     header['type'] = str(res.dtype)
@@ -97,6 +99,7 @@ class ZmqWorker(Worker):
                     push_sock.send_json(header, flags=zmq.SNDMORE)
                     flag = 0 if (itask == len(self.tasks) - 1) else zmq.SNDMORE
                     push_sock.send(res, flag)
+                print("for loop done.")
             else:
                 push_sock.send_json(header)
 
@@ -110,7 +113,7 @@ class Hdf5Worker(Worker):
         push_sock = context.socket(zmq.PUSH)
         push_sock.connect('tcp://localhost:%u'%INTERNAL_PORT)
         fh = h5py.File(self.filename, 'r')
-        dset = fh['/entry/measurement/Eiger/data']
+        dset = fh['/entry/measurement/pilatus/frames']
         nimages = len(dset)
         if self.worker_id == 0:
             hdr = {'filename': self.filename,
@@ -185,6 +188,7 @@ def collector(tasks, disposable=False):
                 if fh:
                     dset = fh.get(dsetname)
                     if not dset:
+                        print("create dataset")
                         for k, v in task.make_extras().items():
                             if v is not None:
                                 fh.create_dataset(k, data=v)
@@ -199,12 +203,14 @@ def collector(tasks, disposable=False):
         elif htype == 'header':
             filename = header['filename']
             if filename:
+                if fh:
+                    fh.close()                
                 path, fname = os.path.split(filename)
                 output_folder = path.replace('raw', 'process/frameprocessing')
                 output_file = os.path.join(output_folder, fname)
                 if not os.path.exists(output_folder):
                     os.makedirs(output_folder)
-                fh = h5py.File(output_file, 'w')
+                fh = h5py.File(output_file, 'a')
             else:
                 fh = None
                 
